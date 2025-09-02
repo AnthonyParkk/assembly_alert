@@ -1,8 +1,9 @@
-# app.py — 과방위 법안 대시보드 (22대 시작일 필터 통합판 / secrets 없이도 동작)
-# - 22대 시작일(2024-05-30)부터 필터
-# - 헤더 가운데 정렬 / 열 폭 px 고정 / 모바일에서 법률안명 2줄 클램프(…)
-# - NaN/None → '-' 처리 / CSV 다운로드 / 새로고침 캐시 / 오류 표시
-# - 로컬(.env) 우선, 없으면 Cloud의 st.secrets 사용(없어도 에러 안 남)
+# app.py — 상임위 의안 대시보드 (위원회 선택: 과방위 or 국토위)
+# - 22대 시작일(2024-05-30) 기본 필터
+# - 한 번만 데이터 수집 → 선택한 위원회만 렌더
+# - 표: 열 폭 px 고정 / '소관위' 그룹 헤더 / 가운데 정렬 / 법률안명 2줄 클램프
+# - NaN/None → '-' 처리 / CSV 다운로드 / 캐시(10분)
+# - 로컬(.env) 우선, 없으면 st.secrets 사용
 
 import os, requests, pandas as pd, certifi, html as _html
 from datetime import datetime, timedelta
@@ -13,13 +14,10 @@ import streamlit as st
 # 기본 셋업 (.env, SSL)
 # ======================
 os.environ["SSL_CERT_FILE"] = certifi.where()
-
 try:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # 스크립트로 실행 시
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 except NameError:
-    BASE_DIR = os.getcwd()  # 노트북 등에서 테스트 시
-
-# .env 로드
+    BASE_DIR = os.getcwd()
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 def env_or_secret(key: str, default=None):
@@ -28,49 +26,50 @@ def env_or_secret(key: str, default=None):
     if val not in (None, ""):
         return val
     try:
-        # secrets.toml이 아예 없을 때 접근해도 except로 빠져 안전
         return st.secrets[key]
     except Exception:
         return default
 
-# 환경 변수/시크릿 읽기
 API_KEY = env_or_secret("NA_OPEN_API_KEY")
 AGE     = int(env_or_secret("NA_ASSEMBLY_AGE", "22"))
 
-# 국회 Open API 설정
+# 국회 Open API
 DATA_ID   = "nzmimeepazxkubdpn"
 BASE_URL  = f"https://open.assembly.go.kr/portal/openapi/{DATA_ID}"
 
-# 22대 시작일(기본 필터)
+# 22대 시작일
 K22_START = pd.Timestamp("2024-05-30")
 
-# UI 기본값
-DEFAULT_COMMITTEE = "과학기술정보방송통신위원회"
+# UI 프리셋
 DEFAULT_START     = K22_START
 DEFAULT_PSIZE     = 100
 DEFAULT_MAXPAGES  = 200
+COMMITTEES        = ["과학기술정보방송통신위원회", "국토교통위원회"]
 
 # ======================
-# Streamlit 레이아웃/UI
+# 페이지 메타 & 헤더
 # ======================
 st.set_page_config(
-    page_title="과방위 의안 현황",   # 브라우저 탭 제목 + 미리보기 제목
+    page_title="과방·국토위 법안 현황",   # 🔗 카톡/슬랙 미리보기 제목
     page_icon="📜",
     layout="wide"
 )
 
-st.title("📜 과방위 의안 현황")
-st.caption("소위 기준 의안 현황")   # 카톡/슬랙 미리보기 설명으로 끌려옴
+st.title("📜 과방·국토위 법안 현황")
+st.caption("22대 기준, 과방위/국토위 법안 현황 대시보드")   # 🔗 카톡/슬랙 미리보기 설명
 
+# ======================
+# 사이드바 (필터 + 위원회 선택)
+# ======================
 with st.sidebar:
     st.header("필터")
-    committee   = st.text_input("소관위원회", value=DEFAULT_COMMITTEE)
+    committee_choice = st.radio("위원회", COMMITTEES, index=0, horizontal=False)
     start_date  = st.date_input("시작일(22대 기준)", value=DEFAULT_START.date())
     page_size   = st.number_input("페이지 크기 (pSize)", min_value=50, max_value=1000, step=50, value=DEFAULT_PSIZE)
     max_pages   = st.number_input("최대 페이지 수", min_value=10, max_value=500, step=10, value=DEFAULT_MAXPAGES)
     search_kw   = st.text_input("검색어(법률안명 또는 대표발의자 포함)")
     clicked_refresh = st.button("🔄 데이터 새로고침")
-    st.caption("※ 시작일 이후 + 소관위원회 일치 + (검색어 포함)")
+    st.caption("※ 시작일 이후 + 위원회 일치 + (검색어 포함)")
 
 # ======================
 # 유틸
@@ -144,7 +143,7 @@ def filter_dataframe(df: pd.DataFrame, committee: str, start_date, search_kw: st
     # 소관위
     if committee:
         df = df[df["소관위원회"] == committee]
-    # 시작일(22대 기본)
+    # 시작일
     start_ts = pd.Timestamp(start_date) if start_date else K22_START
     if "제안일" in df.columns:
         df = df[df["제안일"] >= start_ts]
@@ -158,10 +157,9 @@ def filter_dataframe(df: pd.DataFrame, committee: str, start_date, search_kw: st
     return df
 
 # ======================
-# 표 렌더링 (열 너비 px 고정 + 그룹 헤더 + 가운데 정렬 + 2줄 클램프)
+# 표 렌더링 (px 고정폭 + 그룹 헤더 + 가운데 정렬 + 2줄 클램프)
 # ======================
 def render_table(df: pd.DataFrame, title: str, *, height_px: int = 500):
-    """표 렌더 (열 너비 픽셀 고정 + '소관위' 그룹 헤더 + 가운데 정렬 + 스크롤 + CSV 다운로드)"""
     st.subheader(title)
     if df.empty:
         st.info("표시할 데이터가 없습니다.")
@@ -169,7 +167,7 @@ def render_table(df: pd.DataFrame, title: str, *, height_px: int = 500):
 
     show = df.copy()
 
-    # 표 컬럼 순서(고정)
+    # 표 컬럼 순서
     cols = ["법률안명","제안일","대표발의","소관위상정일","소관위처리일","소관위처리결과","상세보기"]
     cols = [c for c in cols if c in show.columns]
     show = show[cols].copy()
@@ -183,26 +181,24 @@ def render_table(df: pd.DataFrame, title: str, *, height_px: int = 500):
         if c in show.columns:
             show[c] = show[c].fillna("-")
 
-    # 상세보기 링크를 a태그로
+    # 링크
     if "상세보기" in show.columns:
         show["상세보기"] = show["상세보기"].apply(
             lambda url: f'<a href="{_html.escape(url, quote=True)}" target="_blank">바로가기</a>'
             if isinstance(url, str) and url and url != "-" else "-"
         )
 
-    # 🔒 열 너비(px) — 모바일에서 타이트하게 보기 좋게 조정
-    # 필요하면 아래 숫자만 바꾸면 전 화면에 동일 규격 적용됨
+    # 열 너비(px)
     col_width_px = {
-        "법률안명": 280,   # 더 줄이고 싶으면 260/240으로
+        "법률안명": 280,
         "제안일": 110,
         "대표발의": 110,
-        "소관위상정일": 110,  # 그룹: 소관위(상정일/처리일/처리결과)
+        "소관위상정일": 110,
         "소관위처리일": 110,
         "소관위처리결과": 140,
         "상세보기": 110,
     }
 
-    # 🔤 가운데 정렬 + 2줄 클램프(법률안명)
     style = f"""
     <style>
       .billwrap {{
@@ -213,7 +209,7 @@ def render_table(df: pd.DataFrame, title: str, *, height_px: int = 500):
       }}
       table.billtable {{
         border-collapse: collapse;
-        width: max-content;        /* 고정폭 테이블 */
+        width: max-content;
         table-layout: fixed;
         font-size: 14px;
       }}
@@ -221,7 +217,7 @@ def render_table(df: pd.DataFrame, title: str, *, height_px: int = 500):
         border: 1px solid #ddd;
         padding: 8px;
         vertical-align: middle;
-        text-align: center;        /* 전체 가운데 정렬 */
+        text-align: center;
         overflow: hidden;
         white-space: normal;
         word-wrap: break-word;
@@ -229,8 +225,6 @@ def render_table(df: pd.DataFrame, title: str, *, height_px: int = 500):
       }}
       table.billtable th {{ background: #f6f6f6; }}
       table.billtable tr:nth-child(even) {{ background: #fbfbfb; }}
-
-      /* 법률안명 2줄 클램프 */
       .clamp2 {{
         display: -webkit-box;
         -webkit-line-clamp: 2;
@@ -242,7 +236,6 @@ def render_table(df: pd.DataFrame, title: str, *, height_px: int = 500):
     </style>
     """
 
-    # 🔺colgroup으로 각 열 폭을 px로 고정
     def _colgroup_html(ordered_cols):
         parts = []
         for c in ordered_cols:
@@ -250,30 +243,22 @@ def render_table(df: pd.DataFrame, title: str, *, height_px: int = 500):
             parts.append(f'<col style="width:{w}px" />')
         return "<colgroup>" + "".join(parts) + "</colgroup>"
 
-    # ✅ 헤더 2줄 구성: 1행 = 일반 3개 + "소관위"(colspan=3) + 상세보기, 2행 = 하위 3개
-    # 현재 데이터프레임에 없는 열은 자동으로 생략
     has_grp = all(c in show.columns for c in ["소관위상정일","소관위처리일","소관위처리결과"])
-    header_row1 = []
-    header_row2 = []
+    header_row1, header_row2, ordered = [], [], []
 
-    # 열 순서 기준
-    ordered = []
     for c in ["법률안명","제안일","대표발의"]:
         if c in show.columns:
             ordered.append(c)
             header_row1.append(f"<th rowspan='2'>{c}</th>")
 
     if has_grp:
-        # 그룹 헤더
         span = sum(1 for c in ["소관위상정일","소관위처리일","소관위처리결과"] if c in show.columns)
         header_row1.append(f"<th colspan='{span}'>소관위</th>")
-        # 하위 헤더
         for sub in ["소관위상정일","소관위처리일","소관위처리결과"]:
             if sub in show.columns:
                 ordered.append(sub)
                 header_row2.append(f"<th>{sub.replace('소관위','')}</th>")
     else:
-        # 그룹 없으면 개별 헤더로
         for sub in ["소관위상정일","소관위처리일","소관위처리결과"]:
             if sub in show.columns:
                 ordered.append(sub)
@@ -283,25 +268,21 @@ def render_table(df: pd.DataFrame, title: str, *, height_px: int = 500):
         ordered.append("상세보기")
         header_row1.append("<th rowspan='2'>상세보기</th>")
 
-    # tbody
     body_rows = []
     for _, r in show.iterrows():
         tds = []
         for c in ordered:
             v = r[c]
             if c == "법률안명":
-                # 2줄 클램프 + 전체 툴팁
                 safe = _html.escape(str(v), quote=False) if "<a " not in str(v) else str(v)
                 tds.append(f'<td title="{_html.escape(str(v), quote=True)}"><div class="clamp2">{safe}</div></td>')
             else:
-                # 링크 그대로 유지(상세보기) / 일반 텍스트는 escape
                 if c == "상세보기" and isinstance(v, str) and v.startswith("<a "):
                     tds.append(f"<td>{v}</td>")
                 else:
                     tds.append(f"<td>{_html.escape(str(v), quote=False)}</td>")
         body_rows.append("<tr>" + "".join(tds) + "</tr>")
 
-    # 최종 HTML
     table_html = f"""
     <table class="billtable">
       {_colgroup_html(ordered)}
@@ -317,7 +298,7 @@ def render_table(df: pd.DataFrame, title: str, *, height_px: int = 500):
 
     st.components.v1.html(style + f'<div class="billwrap">{table_html}</div>', height=height_px + 70, scrolling=False)
 
-    # CSV 다운로드 (현재 보이는 열 기준)
+    # CSV 다운로드
     csv_bytes = show[ordered].to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
         label="⬇️ 이 표를 CSV로 다운로드",
@@ -327,18 +308,15 @@ def render_table(df: pd.DataFrame, title: str, *, height_px: int = 500):
     )
 
 # ======================
-# 메인 로직
+# 메인 로직 (한 번만 수집 → 선택한 위원회만 렌더)
 # ======================
-# API 키 없으면 화면에 바로 표시하고 중단
 if not API_KEY:
     st.error("`.env`의 NA_OPEN_API_KEY가 비어 있습니다. (클라우드에서는 Secrets에 설정하세요)")
     st.stop()
 
-# 새로고침 누르면 캐시 무효화
 if clicked_refresh:
     fetch_all_rows.clear()
 
-# 데이터 가져오기 (에러도 화면에 표시)
 with st.spinner("데이터 불러오는 중..."):
     try:
         rows, total_cnt, fetched_at = fetch_all_rows(AGE, API_KEY, int(page_size), int(max_pages))
@@ -346,40 +324,36 @@ with st.spinner("데이터 불러오는 중..."):
         st.exception(e)
         st.stop()
 
-st.caption(f"총 수집: {total_cnt}건 • 캐시 시각: {fetched_at.strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"총 수집: {total_cnt}건 • 캐시 시각: {fetched_at.strftime('%Y-%m-%d %H:%M:%S')} • pSize={page_size}")
 
-# DF 구축 & 필터 (22대 시작일을 기본으로 적용)
 df_all = build_dataframe(rows)
 if df_all.empty:
     st.warning("수집된 데이터가 없습니다. (API 응답이 비었거나 필드 구조가 변경되었을 수 있음)")
     st.stop()
 
-df = filter_dataframe(df_all, committee, start_date, search_kw)
-
-# 뷰: 최근 1주 / 월별 / 전체
-tabs = st.tabs(["최근 1주", "월별", "전체 목록"])
+# 선택한 위원회만 필터 → 탭 3종 렌더
 now = pd.Timestamp.now()
 one_week_ago = now - timedelta(days=7)
 
+df_c = filter_dataframe(df_all, committee_choice, start_date, search_kw)
+
+st.markdown(f"## {committee_choice}")
+tabs = st.tabs(["최근 1주", "월별", "전체 목록"])
+
 with tabs[0]:
-    df_week = df[df["제안일"] >= one_week_ago] if "제안일" in df.columns else pd.DataFrame()
-    render_table(df_week, "최근 1주일 내 발의 법안", height_px=500)
+    df_week = df_c[df_c["제안일"] >= one_week_ago] if "제안일" in df_c.columns else pd.DataFrame()
+    render_table(df_week, f"최근 1주일 내 발의 법안 ({committee_choice})", height_px=500)
 
 with tabs[1]:
-    if df.empty or "제안일" not in df.columns:
+    if df_c.empty or "제안일" not in df_c.columns:
         st.info("표시할 데이터가 없습니다.")
     else:
-        tmp = df.copy()
+        tmp = df_c.copy()
         tmp["YYYY-MM"] = tmp["제안일"].dt.to_period("M").astype(str)
-        # 최신 월부터 표시
         for ym, g in sorted(tmp.groupby("YYYY-MM"), key=lambda x: x[0], reverse=True):
-            # 2025-01 월은 좀 더 높게(스크롤 박스 높이 700px)
-            if ym == "2025-01":
-                render_table(g, f"{ym} 발의 법안", height_px=700)
-            else:
-                render_table(g, f"{ym} 발의 법안", height_px=500)
+            render_table(g, f"{ym} 발의 법안 ({committee_choice})", height_px=(700 if ym == "2025-01" else 500))
 
 with tabs[2]:
-    render_table(df, "전체 목록", height_px=700)
+    render_table(df_c, f"전체 목록 ({committee_choice})", height_px=700)
 
 st.success("완료")
